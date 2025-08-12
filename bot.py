@@ -5,11 +5,10 @@ from datetime import datetime
 from dotenv import load_dotenv
 import mysql.connector
 from mysql.connector import pooling
-
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
-# Загрузить .env
+# Загрузка .env
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -19,7 +18,7 @@ DB_PASSWORD = os.getenv('DB_PASSWORD', '')
 DB_NAME = os.getenv('DB_NAME', 'todo_bot')
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError('TELEGRAM_TOKEN не задан. Скопируйте .env.template -> .env и заполните токен')
+    raise RuntimeError('TELEGRAM_TOKEN не задан. Заполните токен в .env')
 
 # Логирование
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
@@ -35,7 +34,7 @@ _db_config = {
     'use_unicode': True,
 }
 
-# Попытки создать пул соединений — полезно, если БД стартует медленнее контейнера
+# Попытки создать пул соединений
 def create_pool_with_retry(retries: int = 10, delay: int = 3):
     last_exc = None
     for attempt in range(1, retries + 1):
@@ -50,7 +49,6 @@ def create_pool_with_retry(retries: int = 10, delay: int = 3):
     logger.error('Не удалось создать пул соединений после %s попыток', retries)
     raise last_exc
 
-# Получить/создать пул
 _pool = None
 try:
     _pool = create_pool_with_retry()
@@ -59,7 +57,7 @@ except Exception as e:
 
 def get_conn():
     if _pool is None:
-        return mysql.connector.connect(**_db_config)
+        return mysql.connector.connect(**_db_config) # Создаем прямое подключение
     return _pool.get_connection()
 
 # Инициализация схемы
@@ -133,20 +131,55 @@ def mark_done(task_id: int, user_id: int) -> int:
     conn.close()
     return affected
 
-def delete_task(task_id: int, user_id: int) -> int:
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM tasks WHERE id = %s AND user_id = %s', (task_id, user_id))
-    conn.commit()
-    affected = cursor.rowcount
-    cursor.close()
-    conn.close()
-    return affected
 
-# === Telegram bot ===
+def delete_task(task_id: int, user_id: int) -> int:
+    conn = None
+    cursor = None
+    try:
+        conn = get_conn()
+        cursor = conn.cursor()
+
+        # Удаляем задачу
+        cursor.execute('DELETE FROM tasks WHERE id = %s AND user_id = %s', (task_id, user_id))
+        affected = cursor.rowcount
+
+        if affected > 0:
+            # Получаем оставшиеся задачи пользователя в порядке создания
+            cursor.execute('''
+                SELECT id FROM tasks 
+                WHERE user_id = %s 
+                ORDER BY created_at
+            ''', (user_id,))
+
+            remaining_tasks = cursor.fetchall()
+
+            # Перенумеровываем оставшиеся задачи
+            for new_id, (old_id,) in enumerate(remaining_tasks, start=1):
+                if new_id != old_id:
+                    cursor.execute('''
+                        UPDATE tasks 
+                        SET id = %s 
+                        WHERE id = %s AND user_id = %s
+                    ''', (new_id, old_id, user_id))
+
+            conn.commit()
+
+        return affected
+
+    except Exception as e:
+        logger.error(f'Ошибка при удалении задачи: {e}')
+        if conn:
+            conn.rollback()
+        return 0
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode='HTML')
 
-# Главное меню
 def main_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(
